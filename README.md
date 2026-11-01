@@ -24,6 +24,7 @@ AI彼氏チャットアプリ。普段は甘く寄り添い、相談されたと
 | チャットと SSE での返事 | 送信すると、返事が少しずつ流れて届く。停止・再送・二重送信の防止、モデルの自動フォールバック |
 | 意図判定と応答モード | メッセージごとに軽量モデルで雑談(`casual`)か相談(`advice`)かを判定し、口調・長さ・モデルを切り替える |
 | 安全チェック | 命に関わる話を検知すると `crisis` モードにし、受け止める返事の後に相談窓口(電話・SNS 相談)のカードを出す。開き直しても同じ位置に出る |
+| 長期記憶 | 会話から覚えておくことを取り出し、新しい会話でも関係のある記憶を使って返事をする。覚えていることは「覚えていること」の画面で見て消せる。会話で「それは忘れて」と言えば直せる |
 
 ## 全体構成
 
@@ -43,8 +44,8 @@ flowchart LR
     api -- "SSE(返事のストリーム)" --> Service
 
     llm --> Claude["Anthropic(Claude)"]
-    llm --> OpenAI["OpenAI(GPT)"]
-    repositories --> PG[("PostgreSQL<br/>ユーザー・会話・メッセージ")]
+    llm --> OpenAI["OpenAI(GPT・Embeddings)"]
+    repositories --> PG[("PostgreSQL(pgvector)<br/>ユーザー・会話・メッセージ・記憶")]
     services --> Redis[("Redis<br/>会話ごとの生成ロック")]
 ```
 
@@ -52,8 +53,8 @@ flowchart LR
 |---|---|
 | mobile | Flutter, Riverpod, dio, go_router, freezed |
 | backend | Python 3.12+, uv, FastAPI, Pydantic v2, SQLAlchemy 2 (async), Alembic |
-| LLM | `anthropic` / `openai` SDK を `app/llm` の抽象層でラップ |
-| DB | PostgreSQL、Redis |
+| LLM | `anthropic` / `openai` SDK を `app/llm` の抽象層でラップ。記憶の埋め込みは `text-embedding-3-large` |
+| DB | PostgreSQL(pgvector)、Redis |
 
 ### この構成にした理由
 
@@ -62,6 +63,8 @@ flowchart LR
 | 返事は **SSE** で流す | 返事はサーバーから一方向に流すだけなので、WebSocket ほどの双方向性は要らない。HTTP のままなので、認証・ロードバランサー・再接続の扱いが簡単 |
 | **LLM の抽象層**(`LLMProvider`)を挟み、モデルはサーバーが選ぶ | 1 社の障害で止まらないよう、最初の文字を送る前に失敗したら別のプロバイダーへ自動で切り替える。用途(雑談・相談・判定)ごとにモデルとコストを変えられる。API の応答にモデル名を出さないので、モデルを変えてもアプリを更新しなくてよい |
 | 安全チェックと意図判定を**同時に**行う | 返事が始まるまでの待ち時間を短くする。安全チェックは意図判定とは別に行い、結果を優先する。判定に失敗しても固定の語句リストで判定し直す |
+| 記憶の検索は LLM を使わず**ベクトル検索**で行い、判定と**同時に**動かす | 埋め込みと pgvector のコサイン類似度で探すので、「ペット」と「猫」のように同じ言葉がなくても当たる。判定と同時に動かし、返事が始まるまでの待ち時間を増やさない。失敗やタイムアウトのときは記憶なしで返事をする |
+| 記憶の取り出しは返事の**後に裏で**行う | 返事を待たせない。crisis のやりとりはモデルに渡す前に除き、別の会話で不用意に持ち出さないようにする。要配慮の話や秘密の情報は覚えないよう指示し、取りこぼしはユーザーが画面から消せる |
 | backend は `api → services → repositories / llm → db` の**一方向の依存** | SDK を呼んでよいのは `llm/`、SQL を書いてよいのは `repositories/` だけにし、差し替えとテスト(LLM のモック)をしやすくする |
 | mobile は公式ガイドに沿った **MVVM**(Riverpod) | 画面は表示だけにし、SSE の受け取りや状態の更新を ViewModel と Repository に分けてテストする |
 | **モノレポ** | API の契約(backend)と使う側(mobile)を 1 つの PR で一緒に変えられる。CI は paths フィルタで変更があった側だけ動かす |
@@ -73,6 +76,9 @@ erDiagram
     users ||--o{ conversations : has
     conversations ||--o{ messages : has
     messages ||--o| messages : "reply_to"
+    users ||--o{ memories : has
+    memories ||--|{ memory_sources : "取り出し元"
+    conversations ||--o{ memory_sources : has
 
     users {
         uuid id PK
@@ -102,6 +108,20 @@ erDiagram
         int tokens_out
         timestamp created_at
     }
+    memories {
+        uuid id PK
+        uuid user_id FK
+        text content "ユーザーを主語にした 1 文"
+        vector embedding "1536 次元"
+        string embedding_model "埋め込んだモデル"
+        timestamp created_at
+        timestamp updated_at
+    }
+    memory_sources {
+        uuid memory_id PK,FK
+        uuid conversation_id PK,FK
+        timestamp created_at
+    }
 ```
 
 設計のポイント:
@@ -111,6 +131,9 @@ erDiagram
 - **`messages.mode` / `safety` / `model_key`**: どのモードで、どのモデルが答えたかを残し、判定の精度やコストを後から調べられるようにする。モデル名は API には出さない
 - **`messages.safety`**: crisis と判定したことをユーザーのメッセージに記録し、会話を開き直しても相談窓口のカードを同じ位置に出す
 - **`messages.citations` / `tokens_in` / `tokens_out`**: 出典(RAG)と、使用量・レート制限の仕様で使うために用意した列で、今は NULL
+- **`memories.embedding_model`**: どのモデルで埋め込んだかを残し、同じモデルで埋め込んだ記憶だけを比べる。モデルを変えたときに埋め込み直す記憶を見分けられる
+- **`memories.updated_at`**: 最近覚えた・書き換えた記憶を選ぶのに使う。似ている記憶がない「おはよう」でも、前の話の続きを話せるようにする
+- **`memory_sources`**: 記憶の内容に関わった会話をすべて残し、会話を消したときに、その会話から覚えた記憶を探せるようにする
 
 ## データの流れ(1 通送ったとき)
 
@@ -131,22 +154,33 @@ sequenceDiagram
         API->>LLM: 安全チェック
     and
         API->>LLM: 意図判定(casual / advice)
+    and
+        API->>LLM: 記憶の検索の問い合わせを埋め込む
+        API->>DB: ベクトルが近い記憶と、最近の記憶を探す
     end
 
     alt crisis と判定
         API->>DB: ユーザーのメッセージに crisis を記録
         API-->>App: SSE safety(相談窓口)
-        Note over API: 意図判定を取り消す
+        Note over API: 意図判定と記憶の検索を取り消す
     end
 
-    API->>LLM: モードに合わせたプロンプトで生成(失敗したら別のプロバイダーへ)
+    API->>LLM: モードと記憶を入れたプロンプトで生成(失敗したら別のプロバイダーへ)
     loop 生成中
         LLM-->>API: トークン
         API-->>App: SSE delta(本文の差分)
     end
     API->>DB: 返事を保存(mode, model_key)
     API-->>App: SSE done(message_id, mode)
+
+    opt crisis 以外で、返事を最後まで保存できたとき(裏で行う)
+        API->>LLM: 覚えることを取り出す(add / update / delete)
+        API->>LLM: add と update の 1 文を埋め込む
+        API->>DB: 記憶を保存・書き換え・削除
+    end
 ```
+
+記憶は、似ている記憶(最大 5 件)と最近覚えた記憶(3 件)をプロンプトの「ユーザーについて覚えていること」の区画に入れる。crisis のときは記憶を入れず、取り出しもしない。
 
 SSE のイベントは `start` / `safety` / `delta` / `done` / `error`(出典を送る `citations` は RAG を入れるときに足す)。`error` には `retryable` を付け、アプリは再送できるかどうかで表示を変える。
 
@@ -200,9 +234,8 @@ flowchart TD
 - **データの削除**: 会話の削除や退会のときに、関連するデータを残さず消す
 - **プライバシーポリシー**: 会話が外部の LLM に送られることをユーザーに示す
 
-### 会話の質を上げる(1. 長期記憶 → 2. RAG → 3. Web 検索)
+### 会話の質を上げる(1. RAG → 2. Web 検索)
 
-- **長期記憶**: 新しい会話でも、以前に話したことを覚えていてくれるようにする。覚えていることは、ユーザーが見て消せるようにする
 - **RAG**: 相談に答えるときに、信頼できる資料を根拠にして出典を示す
 - **Web 検索**: RAG の資料にない新しい話題を補う。根拠の質を保つため、RAG の後に入れる
 
